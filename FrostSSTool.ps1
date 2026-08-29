@@ -1,0 +1,778 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+
+$script:ToolName = 'Frost SS Tool'
+$script:Version = '2.0.0'
+$script:Findings = [System.Collections.Generic.List[object]]::new()
+$script:ScannedFiles = 0
+$script:ScannedProcesses = 0
+$script:CompletedScans = [System.Collections.Generic.List[string]]::new()
+$script:ActionButtons = [System.Collections.Generic.List[System.Windows.Forms.Button]]::new()
+
+$script:StrongIndicators = [ordered]@{
+    'Meteor Client'  = '(?i)(^|[^a-z0-9])meteor([ _.-]?client)?([^a-z0-9]|$)'
+    'LiquidBounce'   = '(?i)liquid[ _.-]?bounce'
+    'Wurst Client'   = '(?i)(^|[^a-z0-9])wurst([ _.-]?client)?([^a-z0-9]|$)'
+    'Aristois'       = '(?i)aristois'
+    'Impact Client'  = '(?i)(^|[^a-z0-9])impact[ _.-]?client([^a-z0-9]|$)'
+    'Inertia Client' = '(?i)(^|[^a-z0-9])inertia([ _.-]?client)?([^a-z0-9]|$)'
+    'BleachHack'     = '(?i)bleach[ _.-]?hack'
+    'RusherHack'     = '(?i)rusher[ _.-]?hack'
+    'Future Client'  = '(?i)future[ _.-]?client'
+    'Mathax'         = '(?i)mathax'
+    'ThunderHack'    = '(?i)thunder[ _.-]?hack'
+    'Lambda Client'  = '(?i)lambda[ _.-]?client'
+    'KAMI Blue'      = '(?i)kami[ _.-]?blue'
+    'Vape Client'    = '(?i)(^|[^a-z0-9])vape([ _.-]?client)?([^a-z0-9]|$)'
+    'Raven Client'   = '(?i)raven[ _.-]?(b\+?|client)'
+}
+
+$script:HeuristicIndicators = [ordered]@{
+    'Auto Clicker term' = '(?i)auto[ _.-]?click(er)?'
+    'Aim Assist term'   = '(?i)aim[ _.-]?assist'
+    'Reach term'        = '(?i)(^|[^a-z0-9])reach[ _.-]?(mod|hack|client)([^a-z0-9]|$)'
+    'Velocity term'     = '(?i)(^|[^a-z0-9])velocity[ _.-]?(mod|hack|client)([^a-z0-9]|$)'
+    'Injector term'     = '(?i)(^|[^a-z0-9])(injector|dll[ _.-]?inject)([^a-z0-9]|$)'
+    'Ghost client term' = '(?i)ghost[ _.-]?client'
+}
+
+function Get-UiColor {
+    param([string]$Hex)
+    return [System.Drawing.ColorTranslator]::FromHtml($Hex)
+}
+
+$script:Colors = @{
+    Background = Get-UiColor '#07111F'
+    Surface    = Get-UiColor '#0B1A2B'
+    Panel      = Get-UiColor '#10243A'
+    Border     = Get-UiColor '#1E4668'
+    Cyan       = Get-UiColor '#66DEFF'
+    Blue       = Get-UiColor '#3987FF'
+    Text       = Get-UiColor '#EEF8FF'
+    Muted      = Get-UiColor '#8EA8BF'
+    Green      = Get-UiColor '#5EE6A8'
+    Yellow     = Get-UiColor '#FFD166'
+    Red        = Get-UiColor '#FF657A'
+}
+
+function Get-IndicatorMatches {
+    param([AllowNull()][string]$Text)
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @($results) }
+
+    foreach ($entry in $script:StrongIndicators.GetEnumerator()) {
+        if ($Text -match $entry.Value) {
+            $results.Add([pscustomobject]@{ Name = $entry.Key; Risk = 'High' })
+        }
+    }
+    foreach ($entry in $script:HeuristicIndicators.GetEnumerator()) {
+        if ($Text -match $entry.Value) {
+            $results.Add([pscustomobject]@{ Name = $entry.Key; Risk = 'Medium' })
+        }
+    }
+    return @($results)
+}
+
+function Get-SafeHash {
+    param([AllowNull()][string]$Path)
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($Path) -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+    } catch {}
+    return ''
+}
+
+function Update-Counters {
+    $script:FindingValue.Text = [string]$script:Findings.Count
+    $script:FileValue.Text = [string]$script:ScannedFiles
+    $script:ProcessValue.Text = [string]$script:ScannedProcesses
+    $script:ResultCount.Text = ('{0} RESULT{1}' -f $script:Findings.Count, $(if ($script:Findings.Count -eq 1) { '' } else { 'S' }))
+}
+
+function Set-Status {
+    param(
+        [string]$Text,
+        [string]$Color = 'Muted'
+    )
+    $script:StatusLabel.Text = $Text
+    $script:StatusLabel.ForeColor = $script:Colors[$Color]
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Add-Finding {
+    param(
+        [string]$Scan,
+        [ValidateSet('Info', 'Medium', 'High')][string]$Risk,
+        [string]$Indicator,
+        [string]$Evidence,
+        [AllowNull()][string]$Path,
+        [AllowNull()][string]$Sha256,
+        [string]$Notes
+    )
+
+    $finding = [pscustomobject][ordered]@{
+        TimeUtc   = (Get-Date).ToUniversalTime().ToString('o')
+        Risk      = $Risk
+        Scan      = $Scan
+        Indicator = $Indicator
+        Evidence  = $Evidence
+        Path      = $Path
+        SHA256    = $Sha256
+        Notes     = $Notes
+    }
+    $script:Findings.Add($finding)
+
+    $rowIndex = $script:ResultGrid.Rows.Add($Risk, $Indicator, $Scan, $Evidence, $Path)
+    $row = $script:ResultGrid.Rows[$rowIndex]
+    switch ($Risk) {
+        'High'   { $row.Cells[0].Style.ForeColor = $script:Colors.Red }
+        'Medium' { $row.Cells[0].Style.ForeColor = $script:Colors.Yellow }
+        default  { $row.Cells[0].Style.ForeColor = $script:Colors.Cyan }
+    }
+    $row.Cells[0].Style.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 9)
+    $row.Tag = $finding
+    Update-Counters
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Clear-Results {
+    $script:Findings.Clear()
+    $script:CompletedScans.Clear()
+    $script:ScannedFiles = 0
+    $script:ScannedProcesses = 0
+    $script:ResultGrid.Rows.Clear()
+    Update-Counters
+    Set-Status 'Ready. Choose a scan module.' 'Muted'
+}
+
+function Complete-Scan {
+    param([string]$Name)
+    if (-not $script:CompletedScans.Contains($Name)) {
+        $script:CompletedScans.Add($Name)
+    }
+}
+
+function Get-MinecraftRoots {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if ($env:APPDATA) {
+        $candidates.Add((Join-Path $env:APPDATA '.minecraft'))
+        $candidates.Add((Join-Path $env:APPDATA 'PrismLauncher\instances'))
+        $candidates.Add((Join-Path $env:APPDATA 'ModrinthApp\profiles'))
+        $candidates.Add((Join-Path $env:APPDATA '.feather'))
+        $candidates.Add((Join-Path $env:APPDATA '.lunarclient'))
+    }
+    if ($env:USERPROFILE) {
+        $candidates.Add((Join-Path $env:USERPROFILE 'curseforge\minecraft\Instances'))
+    }
+
+    $unique = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            [void]$unique.Add($candidate)
+        }
+    }
+    return @($unique)
+}
+
+function Get-ModDirectories {
+    param(
+        [string[]]$Roots,
+        [switch]$DefaultOnly
+    )
+
+    $directories = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($root in $Roots) {
+        $directMods = Join-Path $root 'mods'
+        if (Test-Path -LiteralPath $directMods -PathType Container) {
+            [void]$directories.Add($directMods)
+        }
+        if (-not $DefaultOnly) {
+            try {
+                Get-ChildItem -LiteralPath $root -Directory -Recurse -Filter 'mods' -ErrorAction SilentlyContinue |
+                    Select-Object -First 200 | ForEach-Object { [void]$directories.Add($_.FullName) }
+            } catch {}
+        }
+    }
+    return @($directories)
+}
+
+function Read-JarMetadata {
+    param([string]$Path)
+
+    $wanted = @('fabric.mod.json', 'quilt.mod.json', 'META-INF/mods.toml', 'META-INF/neoforge.mods.toml', 'META-INF/MANIFEST.MF')
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $archive = $null
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        foreach ($entry in $archive.Entries) {
+            $normalized = $entry.FullName.Replace('\', '/')
+            if ($wanted -contains $normalized -and $entry.Length -le 1048576) {
+                $stream = $entry.Open()
+                $reader = [System.IO.StreamReader]::new($stream)
+                try { $parts.Add($reader.ReadToEnd()) }
+                finally {
+                    $reader.Dispose()
+                    $stream.Dispose()
+                }
+            }
+        }
+    } catch {
+        return ''
+    } finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+    }
+    return ($parts -join [Environment]::NewLine)
+}
+
+function Scan-Processes {
+    Set-Status 'Inspecting running processes...' 'Cyan'
+    $before = $script:Findings.Count
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        foreach ($process in $processes) {
+            $script:ScannedProcesses++
+            $text = @($process.Name, $process.ExecutablePath, $process.CommandLine) -join ' '
+            foreach ($match in @(Get-IndicatorMatches -Text $text)) {
+                $path = [string]$process.ExecutablePath
+                Add-Finding -Scan 'Running processes' -Risk $match.Risk -Indicator $match.Name -Evidence ('Process: ' + $process.Name + ' | PID ' + $process.ProcessId) -Path $path -Sha256 (Get-SafeHash -Path $path) -Notes 'Matched process metadata. Review manually.'
+            }
+            if (($script:ScannedProcesses % 20) -eq 0) {
+                Update-Counters
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+        }
+    } catch {
+        Add-Finding -Scan 'Running processes' -Risk 'Info' -Indicator 'Process scan unavailable' -Evidence $_.Exception.Message -Path '' -Sha256 '' -Notes 'Administrator rights are optional but may reveal more paths.'
+    }
+    Complete-Scan 'Running processes'
+    return ($script:Findings.Count - $before)
+}
+
+function Scan-ModFiles {
+    param([switch]$DefaultOnly)
+
+    $name = if ($DefaultOnly) { 'Default Minecraft mods' } else { 'All Minecraft instances' }
+    Set-Status ('Inspecting ' + $name.ToLowerInvariant() + '...') 'Cyan'
+    $before = $script:Findings.Count
+    $roots = @(Get-MinecraftRoots)
+
+    if ($DefaultOnly -and $env:APPDATA) {
+        $defaultRoot = Join-Path $env:APPDATA '.minecraft'
+        $roots = @($roots | Where-Object { $_ -ieq $defaultRoot })
+    }
+
+    $directories = @(Get-ModDirectories -Roots $roots -DefaultOnly:$DefaultOnly)
+    foreach ($directory in $directories) {
+        $files = @(Get-ChildItem -LiteralPath $directory -File -Filter '*.jar' -ErrorAction SilentlyContinue)
+        foreach ($file in $files) {
+            $script:ScannedFiles++
+            $nameMatches = @(Get-IndicatorMatches -Text $file.Name)
+            $metadataMatches = @(Get-IndicatorMatches -Text (Read-JarMetadata -Path $file.FullName))
+            $matches = @($nameMatches + $metadataMatches | Sort-Object Name -Unique)
+
+            foreach ($match in $matches) {
+                $source = if (@($nameMatches | Where-Object { $_.Name -eq $match.Name }).Count -gt 0) { 'Filename match' } else { 'Safe JAR metadata match' }
+                Add-Finding -Scan $name -Risk $match.Risk -Indicator $match.Name -Evidence $source -Path $file.FullName -Sha256 (Get-SafeHash -Path $file.FullName) -Notes 'Indicator only; verify manually before taking action.'
+            }
+            if (($script:ScannedFiles % 15) -eq 0) {
+                Update-Counters
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+        }
+    }
+    Complete-Scan $name
+    return ($script:Findings.Count - $before)
+}
+
+function Scan-RecentFiles {
+    Set-Status 'Inspecting recent Downloads and Desktop filenames...' 'Cyan'
+    $before = $script:Findings.Count
+    $cutoff = (Get-Date).AddDays(-30)
+    $downloads = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
+    $folders = @($downloads, [Environment]::GetFolderPath('Desktop'))
+    $extensions = @('.jar', '.exe', '.dll', '.zip', '.rar', '.7z')
+
+    foreach ($folder in $folders) {
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+        try {
+            Get-ChildItem -LiteralPath $folder -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge $cutoff -and $extensions -contains $_.Extension.ToLowerInvariant() } |
+                Select-Object -First 3000 | ForEach-Object {
+                    $script:ScannedFiles++
+                    foreach ($match in @(Get-IndicatorMatches -Text $_.Name)) {
+                        Add-Finding -Scan 'Recent filenames' -Risk $match.Risk -Indicator $match.Name -Evidence 'Filename modified within 30 days' -Path $_.FullName -Sha256 (Get-SafeHash -Path $_.FullName) -Notes 'Only matching filenames are flagged.'
+                    }
+                    if (($script:ScannedFiles % 20) -eq 0) {
+                        Update-Counters
+                        [System.Windows.Forms.Application]::DoEvents()
+                    }
+                }
+        } catch {
+            Add-Finding -Scan 'Recent filenames' -Risk 'Info' -Indicator 'Folder unavailable' -Evidence $_.Exception.Message -Path $folder -Sha256 '' -Notes 'No permissions were bypassed.'
+        }
+    }
+    Complete-Scan 'Recent filenames'
+    return ($script:Findings.Count - $before)
+}
+
+function Scan-Prefetch {
+    Set-Status 'Inspecting Windows Prefetch filenames...' 'Cyan'
+    $before = $script:Findings.Count
+    $prefetch = Join-Path $env:SystemRoot 'Prefetch'
+    if (Test-Path -LiteralPath $prefetch -PathType Container) {
+        try {
+            foreach ($file in @(Get-ChildItem -LiteralPath $prefetch -File -Filter '*.pf' -ErrorAction Stop)) {
+                foreach ($match in @(Get-IndicatorMatches -Text $file.Name)) {
+                    Add-Finding -Scan 'Prefetch filenames' -Risk $match.Risk -Indicator $match.Name -Evidence 'Prefetch filename match' -Path $file.FullName -Sha256 '' -Notes 'May indicate execution; review manually.'
+                }
+            }
+        } catch {
+            Add-Finding -Scan 'Prefetch filenames' -Risk 'Info' -Indicator 'Prefetch unavailable' -Evidence $_.Exception.Message -Path $prefetch -Sha256 '' -Notes 'Administrator rights may be required.'
+        }
+    }
+    Complete-Scan 'Prefetch filenames'
+    return ($script:Findings.Count - $before)
+}
+
+function Verify-OneFile {
+    $dialog = [System.Windows.Forms.OpenFileDialog]::new()
+    $dialog.Title = 'Select a file to inspect safely'
+    $dialog.Filter = 'Supported files|*.jar;*.exe;*.dll;*.zip;*.rar;*.7z|All files|*.*'
+    if ($dialog.ShowDialog($script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    Set-Status 'Verifying selected file...' 'Cyan'
+    $path = $dialog.FileName
+    $file = Get-Item -LiteralPath $path
+    $script:ScannedFiles++
+    $matches = @(Get-IndicatorMatches -Text $file.Name)
+    if ($file.Extension -ieq '.jar') {
+        $matches += @(Get-IndicatorMatches -Text (Read-JarMetadata -Path $file.FullName))
+    }
+    $matches = @($matches | Sort-Object Name -Unique)
+
+    if ($matches.Count -eq 0) {
+        Add-Finding -Scan 'Single-file verification' -Risk 'Info' -Indicator 'No known text indicator' -Evidence 'Hashed without execution' -Path $file.FullName -Sha256 (Get-SafeHash -Path $file.FullName) -Notes 'No match does not prove that a file is safe.'
+    } else {
+        foreach ($match in $matches) {
+            Add-Finding -Scan 'Single-file verification' -Risk $match.Risk -Indicator $match.Name -Evidence 'Filename or safe JAR metadata match' -Path $file.FullName -Sha256 (Get-SafeHash -Path $file.FullName) -Notes 'Verify manually before taking action.'
+        }
+    }
+    Complete-Scan 'Single-file verification'
+}
+
+function Invoke-UiScan {
+    param(
+        [string]$Name,
+        [scriptblock]$Action
+    )
+
+    Clear-Results
+    foreach ($button in $script:ActionButtons) { $button.Enabled = $false }
+    $script:MainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $script:Progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $script:Progress.MarqueeAnimationSpeed = 24
+    $script:Progress.Visible = $true
+
+    try {
+        & $Action
+        Update-Counters
+        if ($script:Findings.Count -eq 0) {
+            Set-Status ($Name + ' complete - no known indicators found.') 'Green'
+        } else {
+            Set-Status ($Name + ' complete - review ' + $script:Findings.Count + ' result(s).') 'Yellow'
+        }
+    } catch {
+        Set-Status ('Scan stopped safely: ' + $_.Exception.Message) 'Red'
+    } finally {
+        $script:Progress.Visible = $false
+        $script:Progress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+        $script:MainForm.Cursor = [System.Windows.Forms.Cursors]::Default
+        foreach ($button in $script:ActionButtons) { $button.Enabled = $true }
+    }
+}
+
+function Export-Report {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    if ([string]::IsNullOrWhiteSpace($desktop)) { $desktop = $env:USERPROFILE }
+    $folder = Join-Path $desktop 'Frost SS Tool Reports'
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+
+    $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+    $jsonPath = Join-Path $folder ('Frost-SS-Report_' + $stamp + '.json')
+    $htmlPath = Join-Path $folder ('Frost-SS-Report_' + $stamp + '.html')
+    $report = [pscustomobject][ordered]@{
+        Tool = $script:ToolName
+        Version = $script:Version
+        CreatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        CompletedScans = @($script:CompletedScans)
+        ScannedFiles = $script:ScannedFiles
+        ScannedProcesses = $script:ScannedProcesses
+        Findings = @($script:Findings)
+        Disclaimer = 'Indicators require manual review and are not automatic proof of cheating.'
+    }
+    $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+
+    $rows = [System.Text.StringBuilder]::new()
+    foreach ($finding in $script:Findings) {
+        $riskColor = if ($finding.Risk -eq 'High') { '#FF657A' } elseif ($finding.Risk -eq 'Medium') { '#FFD166' } else { '#66DEFF' }
+        $values = @($finding.Risk, $finding.Indicator, $finding.Scan, $finding.Evidence, $finding.Path, $finding.SHA256)
+        $encoded = @($values | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) })
+        [void]$rows.AppendLine('<tr><td style="color:' + $riskColor + ';font-weight:700">' + $encoded[0] + '</td><td>' + $encoded[1] + '</td><td>' + $encoded[2] + '</td><td>' + $encoded[3] + '</td><td class="path">' + $encoded[4] + '</td><td class="path">' + $encoded[5] + '</td></tr>')
+    }
+    if ($script:Findings.Count -eq 0) {
+        [void]$rows.AppendLine('<tr><td colspan="6" class="clear">No known indicators were found.</td></tr>')
+    }
+
+    $html = @"
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Frost SS Tool Report</title>
+<style>body{margin:0;background:#07111f;color:#eef8ff;font-family:Segoe UI,Arial}.wrap{max-width:1400px;margin:auto;padding:32px}h1{color:#66deff}.notice{background:#10243a;border:1px solid #1e4668;border-radius:12px;padding:16px;margin:20px 0}table{width:100%;border-collapse:collapse;background:#0b1a2b}th,td{text-align:left;padding:12px;border-bottom:1px solid #1e4668}th{color:#66deff}.path{font:12px Consolas;word-break:break-all}.clear{color:#5ee6a8;text-align:center;padding:30px}</style></head>
+<body><main class="wrap"><h1>Frost SS Tool</h1><p>Local inspection report | Version $($script:Version)</p><div class="notice">Findings are indicators for manual review, not automatic proof of cheating. Nothing was uploaded by Frost SS Tool.</div><p>Files checked: $($script:ScannedFiles) &nbsp; Processes checked: $($script:ScannedProcesses) &nbsp; Findings: $($script:Findings.Count)</p><table><thead><tr><th>Risk</th><th>Indicator</th><th>Module</th><th>Evidence</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>$($rows.ToString())</tbody></table></main></body></html>
+"@
+    [System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.UTF8Encoding]::new($false))
+    Start-Process explorer.exe $folder
+    [System.Windows.Forms.MessageBox]::Show($script:MainForm, ("Report saved locally to:" + [Environment]::NewLine + $folder), 'Frost SS Tool', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+}
+
+function New-NavButton {
+    param(
+        [string]$Text,
+        [string]$Accent = 'Normal'
+    )
+
+    $button = [System.Windows.Forms.Button]::new()
+    $button.Text = $Text
+    $button.Width = 188
+    $button.Height = 42
+    $button.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 8)
+    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $button.FlatAppearance.BorderSize = 1
+    $button.FlatAppearance.BorderColor = $script:Colors.Border
+    $button.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 10)
+    $button.ForeColor = $script:Colors.Text
+    $button.BackColor = if ($Accent -eq 'Primary') { $script:Colors.Blue } else { $script:Colors.Panel }
+    $button.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $button.Padding = [System.Windows.Forms.Padding]::new(14, 0, 0, 0)
+    $button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $button.Add_MouseEnter({
+        if ($this.Enabled) { $this.BackColor = $script:Colors.Border }
+    })
+    $button.Add_MouseLeave({
+        if ($this.Text -eq 'Quick scan') { $this.BackColor = $script:Colors.Blue }
+        else { $this.BackColor = $script:Colors.Panel }
+    })
+    $script:ActionButtons.Add($button)
+    return $button
+}
+
+function New-StatCard {
+    param(
+        [string]$Label,
+        [ref]$ValueControl
+    )
+
+    $panel = [System.Windows.Forms.Panel]::new()
+    $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $panel.Margin = [System.Windows.Forms.Padding]::new(0, 0, 12, 0)
+    $panel.BackColor = $script:Colors.Panel
+    $panel.Padding = [System.Windows.Forms.Padding]::new(17, 12, 17, 10)
+
+    $value = [System.Windows.Forms.Label]::new()
+    $value.Text = '0'
+    $value.Dock = [System.Windows.Forms.DockStyle]::Top
+    $value.Height = 39
+    $value.ForeColor = $script:Colors.Cyan
+    $value.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 22)
+    $panel.Controls.Add($value)
+
+    $caption = [System.Windows.Forms.Label]::new()
+    $caption.Text = $Label.ToUpperInvariant()
+    $caption.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $caption.Height = 22
+    $caption.ForeColor = $script:Colors.Muted
+    $caption.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 8)
+    $panel.Controls.Add($caption)
+
+    $ValueControl.Value = $value
+    return $panel
+}
+
+$form = [System.Windows.Forms.Form]::new()
+$script:MainForm = $form
+$form.Text = 'Frost SS Tool'
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$form.Size = [System.Drawing.Size]::new(1180, 760)
+$form.MinimumSize = [System.Drawing.Size]::new(980, 650)
+$form.BackColor = $script:Colors.Background
+$form.ForeColor = $script:Colors.Text
+$form.Font = [System.Drawing.Font]::new('Segoe UI', 9)
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+$form.MaximizeBox = $true
+
+$header = [System.Windows.Forms.Panel]::new()
+$header.Dock = [System.Windows.Forms.DockStyle]::Top
+$header.Height = 76
+$header.BackColor = $script:Colors.Surface
+$header.Padding = [System.Windows.Forms.Padding]::new(24, 10, 24, 8)
+$form.Controls.Add($header)
+
+$brand = [System.Windows.Forms.Label]::new()
+$brand.Text = 'FROST SS TOOL'
+$brand.AutoSize = $true
+$brand.Location = [System.Drawing.Point]::new(24, 13)
+$brand.ForeColor = $script:Colors.Text
+$brand.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 20)
+$header.Controls.Add($brand)
+
+$versionLabel = [System.Windows.Forms.Label]::new()
+$versionLabel.Text = 'READ-ONLY MINECRAFT INSPECTION  •  v2.0'
+$versionLabel.AutoSize = $true
+$versionLabel.Location = [System.Drawing.Point]::new(27, 47)
+$versionLabel.ForeColor = $script:Colors.Muted
+$versionLabel.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 8)
+$header.Controls.Add($versionLabel)
+
+$liveBadge = [System.Windows.Forms.Label]::new()
+$liveBadge.Text = '●  LOCAL ONLY'
+$liveBadge.AutoSize = $true
+$liveBadge.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$liveBadge.Location = [System.Drawing.Point]::new(1015, 27)
+$liveBadge.ForeColor = $script:Colors.Green
+$liveBadge.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 9)
+$header.Controls.Add($liveBadge)
+$header.Add_Resize({ $liveBadge.Left = $header.ClientSize.Width - $liveBadge.Width - 28 })
+
+$sidebar = [System.Windows.Forms.Panel]::new()
+$sidebar.Dock = [System.Windows.Forms.DockStyle]::Left
+$sidebar.Width = 220
+$sidebar.BackColor = $script:Colors.Surface
+$sidebar.Padding = [System.Windows.Forms.Padding]::new(16, 22, 16, 16)
+$form.Controls.Add($sidebar)
+
+$logo = [System.Windows.Forms.Label]::new()
+$logo.Text = 'F'
+$logo.Width = 54
+$logo.Height = 54
+$logo.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$logo.BackColor = $script:Colors.Cyan
+$logo.ForeColor = $script:Colors.Background
+$logo.Font = [System.Drawing.Font]::new('Segoe UI Black', 25)
+$logo.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 18)
+$sidebar.Controls.Add($logo)
+
+$nav = [System.Windows.Forms.FlowLayoutPanel]::new()
+$nav.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+$nav.WrapContents = $false
+$nav.AutoScroll = $true
+$nav.Location = [System.Drawing.Point]::new(16, 94)
+$nav.Size = [System.Drawing.Size]::new(194, 570)
+$nav.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$sidebar.Controls.Add($nav)
+
+$quickButton = New-NavButton 'Quick scan' 'Primary'
+$fullButton = New-NavButton 'Full safe scan'
+$modsButton = New-NavButton 'Minecraft files'
+$processButton = New-NavButton 'Running processes'
+$recentButton = New-NavButton 'Recent files'
+$prefetchButton = New-NavButton 'Prefetch traces'
+$fileButton = New-NavButton 'Verify one file'
+$exportButton = New-NavButton 'Export report'
+$clearButton = New-NavButton 'Clear results'
+@($quickButton, $fullButton, $modsButton, $processButton, $recentButton, $prefetchButton, $fileButton, $exportButton, $clearButton) | ForEach-Object { [void]$nav.Controls.Add($_) }
+
+$content = [System.Windows.Forms.Panel]::new()
+$content.Dock = [System.Windows.Forms.DockStyle]::Fill
+$content.BackColor = $script:Colors.Background
+$content.Padding = [System.Windows.Forms.Padding]::new(24, 22, 24, 18)
+$form.Controls.Add($content)
+$content.BringToFront()
+
+$stats = [System.Windows.Forms.TableLayoutPanel]::new()
+$stats.Dock = [System.Windows.Forms.DockStyle]::Top
+$stats.Height = 91
+$stats.ColumnCount = 3
+$stats.RowCount = 1
+$stats.BackColor = $script:Colors.Background
+[void]$stats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 33.33))
+[void]$stats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 33.33))
+[void]$stats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 33.34))
+$content.Controls.Add($stats)
+
+$findingRef = $null
+$fileRef = $null
+$processRef = $null
+$stats.Controls.Add((New-StatCard 'Findings' ([ref]$findingRef)), 0, 0)
+$stats.Controls.Add((New-StatCard 'Files checked' ([ref]$fileRef)), 1, 0)
+$stats.Controls.Add((New-StatCard 'Processes checked' ([ref]$processRef)), 2, 0)
+$script:FindingValue = $findingRef
+$script:FileValue = $fileRef
+$script:ProcessValue = $processRef
+
+$notice = [System.Windows.Forms.Panel]::new()
+$notice.Dock = [System.Windows.Forms.DockStyle]::Top
+$notice.Height = 52
+$notice.Margin = [System.Windows.Forms.Padding]::new(0, 12, 0, 12)
+$notice.BackColor = Get-UiColor '#0D2A3D'
+$notice.Padding = [System.Windows.Forms.Padding]::new(14, 10, 14, 8)
+$content.Controls.Add($notice)
+$notice.BringToFront()
+
+$noticeText = [System.Windows.Forms.Label]::new()
+$noticeText.Text = "PRIVACY  •  Scan only with the computer owner's permission. Results stay on this PC and require manual review."
+$noticeText.Dock = [System.Windows.Forms.DockStyle]::Fill
+$noticeText.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$noticeText.ForeColor = $script:Colors.Cyan
+$noticeText.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 9)
+$notice.Controls.Add($noticeText)
+
+$resultHeader = [System.Windows.Forms.Panel]::new()
+$resultHeader.Dock = [System.Windows.Forms.DockStyle]::Top
+$resultHeader.Height = 48
+$resultHeader.Padding = [System.Windows.Forms.Padding]::new(0, 10, 0, 4)
+$content.Controls.Add($resultHeader)
+$resultHeader.BringToFront()
+
+$resultTitle = [System.Windows.Forms.Label]::new()
+$resultTitle.Text = 'Inspection results'
+$resultTitle.AutoSize = $true
+$resultTitle.Location = [System.Drawing.Point]::new(0, 11)
+$resultTitle.ForeColor = $script:Colors.Text
+$resultTitle.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 14)
+$resultHeader.Controls.Add($resultTitle)
+
+$resultCount = [System.Windows.Forms.Label]::new()
+$script:ResultCount = $resultCount
+$resultCount.Text = '0 RESULTS'
+$resultCount.AutoSize = $true
+$resultCount.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$resultCount.ForeColor = $script:Colors.Muted
+$resultCount.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 8)
+$resultHeader.Controls.Add($resultCount)
+$resultHeader.Add_Resize({ $resultCount.Left = $resultHeader.ClientSize.Width - $resultCount.Width - 4; $resultCount.Top = 16 })
+
+$bottom = [System.Windows.Forms.Panel]::new()
+$bottom.Dock = [System.Windows.Forms.DockStyle]::Bottom
+$bottom.Height = 48
+$bottom.Padding = [System.Windows.Forms.Padding]::new(0, 10, 0, 0)
+$content.Controls.Add($bottom)
+
+$statusLabel = [System.Windows.Forms.Label]::new()
+$script:StatusLabel = $statusLabel
+$statusLabel.Text = 'Ready. Choose a scan module.'
+$statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$statusLabel.ForeColor = $script:Colors.Muted
+$statusLabel.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 9)
+$bottom.Controls.Add($statusLabel)
+
+$progress = [System.Windows.Forms.ProgressBar]::new()
+$script:Progress = $progress
+$progress.Dock = [System.Windows.Forms.DockStyle]::Right
+$progress.Width = 190
+$progress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+$progress.Visible = $false
+$bottom.Controls.Add($progress)
+$progress.BringToFront()
+
+$grid = [System.Windows.Forms.DataGridView]::new()
+$script:ResultGrid = $grid
+$grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+$grid.BackgroundColor = $script:Colors.Surface
+$grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$grid.GridColor = $script:Colors.Border
+$grid.EnableHeadersVisualStyles = $false
+$grid.ColumnHeadersDefaultCellStyle.BackColor = $script:Colors.Panel
+$grid.ColumnHeadersDefaultCellStyle.ForeColor = $script:Colors.Cyan
+$grid.ColumnHeadersDefaultCellStyle.Font = [System.Drawing.Font]::new('Segoe UI Semibold', 9)
+$grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $script:Colors.Panel
+$grid.ColumnHeadersHeight = 40
+$grid.RowHeadersVisible = $false
+$grid.RowTemplate.Height = 38
+$grid.DefaultCellStyle.BackColor = $script:Colors.Surface
+$grid.DefaultCellStyle.ForeColor = $script:Colors.Text
+$grid.DefaultCellStyle.SelectionBackColor = $script:Colors.Border
+$grid.DefaultCellStyle.SelectionForeColor = $script:Colors.Text
+$grid.DefaultCellStyle.Font = [System.Drawing.Font]::new('Segoe UI', 9)
+$grid.AlternatingRowsDefaultCellStyle.BackColor = Get-UiColor '#0E2033'
+$grid.ReadOnly = $true
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.AllowUserToResizeRows = $false
+$grid.MultiSelect = $false
+$grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+$grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+[void]$grid.Columns.Add('Risk', 'RISK')
+[void]$grid.Columns.Add('Indicator', 'INDICATOR')
+[void]$grid.Columns.Add('Module', 'MODULE')
+[void]$grid.Columns.Add('Evidence', 'EVIDENCE')
+[void]$grid.Columns.Add('Path', 'PATH')
+$grid.Columns[0].FillWeight = 50
+$grid.Columns[1].FillWeight = 95
+$grid.Columns[2].FillWeight = 90
+$grid.Columns[3].FillWeight = 130
+$grid.Columns[4].FillWeight = 190
+$content.Controls.Add($grid)
+$grid.BringToFront()
+
+$quickButton.Add_Click({
+    Invoke-UiScan 'Quick scan' {
+        [void](Scan-Processes)
+        [void](Scan-ModFiles -DefaultOnly)
+    }
+})
+$fullButton.Add_Click({
+    Invoke-UiScan 'Full safe scan' {
+        [void](Scan-Processes)
+        [void](Scan-ModFiles)
+        [void](Scan-RecentFiles)
+        [void](Scan-Prefetch)
+    }
+})
+$modsButton.Add_Click({ Invoke-UiScan 'Minecraft files scan' { [void](Scan-ModFiles) } })
+$processButton.Add_Click({ Invoke-UiScan 'Process scan' { [void](Scan-Processes) } })
+$recentButton.Add_Click({ Invoke-UiScan 'Recent files scan' { [void](Scan-RecentFiles) } })
+$prefetchButton.Add_Click({ Invoke-UiScan 'Prefetch scan' { [void](Scan-Prefetch) } })
+$fileButton.Add_Click({
+    Clear-Results
+    Verify-OneFile
+    if ($script:CompletedScans.Contains('Single-file verification')) {
+        if ($script:Findings.Count -eq 1 -and $script:Findings[0].Risk -eq 'Info') {
+            Set-Status 'File checked - no known text indicator found.' 'Green'
+        } else {
+            Set-Status 'File checked - review the result.' 'Yellow'
+        }
+    }
+})
+$exportButton.Add_Click({
+    try { Export-Report }
+    catch { [System.Windows.Forms.MessageBox]::Show($script:MainForm, $_.Exception.Message, 'Export failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null }
+})
+$clearButton.Add_Click({ Clear-Results })
+
+$grid.Add_CellDoubleClick({
+    param($sender, $eventArgs)
+    if ($eventArgs.RowIndex -lt 0) { return }
+    $finding = $sender.Rows[$eventArgs.RowIndex].Tag
+    if ($null -ne $finding -and -not [string]::IsNullOrWhiteSpace([string]$finding.Path)) {
+        $target = [string]$finding.Path
+        if (Test-Path -LiteralPath $target -PathType Leaf) {
+            Start-Process explorer.exe ('/select,"' + $target + '"')
+        } elseif (Test-Path -LiteralPath $target -PathType Container) {
+            Start-Process explorer.exe $target
+        }
+    }
+})
+
+Update-Counters
+[void]$form.ShowDialog()
